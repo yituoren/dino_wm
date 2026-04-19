@@ -1,0 +1,27 @@
+# DINO-WM env config for the preprocessed RoboTwin 2.0 dataset
+# (see lwm/sdlwm/data/preprocess.py -> frames.npy + actions_raw.npy layout).
+#
+# ``frameskip: 1`` is deliberate: the raw HDF5 frame-skip (default 5) is
+# already applied during preprocess, so the .npy stream is step-aligned.
+# To recover the original LeWM fs-concat behavior, keep the raw HDF5 path
+# and write a separate loader -- the dataset class here only reads the
+# preprocessed format.
+name: robotwin
+args: []
+kwargs: {}
+
+dataset:
+  _target_: "datasets.robotwin_dset.load_robotwin_slice_train_val"
+  data_path: ${oc.env:ROBOTWIN_PREPROCESSED,/data/robotwin_hard_pretrain}
+  normalize_action: ${normalize_action}
+  split_ratio: 0.95
+  n_rollout: null
+  transform:
+    _target_: "datasets.img_transforms.default_transform"
+    img_size: ${img_size}
+
+# No VAE decoder ckpt shipped for RoboTwin; train a fresh VQ-VAE by keeping
+# has_decoder=true in the root train.yaml, or set has_decoder=false for
+# predictor-only runs.
+decoder_path: null
+num_workers: 8
