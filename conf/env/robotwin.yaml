@@ -12,7 +12,7 @@ kwargs: {}
 
 dataset:
   _target_: "datasets.robotwin_dset.load_robotwin_slice_train_val"
-  data_path: ${oc.env:ROBOTWIN_PREPROCESSED,/data/robotwin_hard_pretrain}
+  data_path: ${oc.env:ROBOTWIN_PREPROCESSED,/cephfs/zhaorui/data/robotwin/dataset/robotwin_hard_pretrain}
   normalize_action: ${normalize_action}
   split_ratio: 0.95
   n_rollout: null

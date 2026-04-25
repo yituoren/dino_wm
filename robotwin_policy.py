@@ -83,6 +83,11 @@ def _load_model_from_ckpt(
 
     ckpt = torch.load(str(ckpt_path), map_location=device)
     modules = {k: ckpt[k].to(device) for k in _MODEL_KEYS if k in ckpt and ckpt[k] is not None}
+    # train.py:save_ckpt bundles per-step action_mean/action_std (1-D tensors,
+    # length = dataset.action_dim_raw) so eval-only machines don't need the
+    # finetune dataset on disk just to recompute normalization stats.
+    bundled_mean = ckpt.get("action_mean")
+    bundled_std = ckpt.get("action_std")
 
     if not GlobalHydra.instance().is_initialized():
         # allow hydra.utils.instantiate to resolve relative _target_ strings
@@ -107,7 +112,7 @@ def _load_model_from_ckpt(
     model.eval()
     for p in model.parameters():
         p.requires_grad_(False)
-    return model, cfg
+    return model, cfg, bundled_mean, bundled_std
 
 
 class DINOWMRoboTwinPolicy:
@@ -139,7 +144,7 @@ class DINOWMRoboTwinPolicy:
         if str(baseline_root) not in sys.path:
             sys.path.insert(0, str(baseline_root))
 
-        self.model, self.cfg = _load_model_from_ckpt(
+        self.model, self.cfg, bundled_mean, bundled_std = _load_model_from_ckpt(
             Path(ckpt_path), Path(hydra_cfg_path), self.device
         )
         self.img_size = int(self.cfg.img_size)
@@ -154,16 +159,26 @@ class DINOWMRoboTwinPolicy:
         self.action_scale = float(action_scale)
 
         # Action normalization stats (match the dataset's normalize_action).
+        # Prefer ckpt-bundled stats (saved by train.py:save_ckpt), fall back
+        # to recomputing from data_path. The latter only matters for old
+        # ckpts saved before stat-baking; retrofit_action_stats.py can
+        # backfill them in-place if needed.
         self.normalize_action = bool(self.cfg.get("normalize_action", False))
         if self.normalize_action:
-            if data_path is None:
+            if bundled_mean is not None and bundled_std is not None:
+                self.action_mean = bundled_mean.float().to(self.device)
+                self.action_std = bundled_std.float().to(self.device)
+            elif data_path is not None:
+                mean, std = _compute_action_stats(Path(data_path))
+                self.action_mean = torch.from_numpy(mean).float().to(self.device)
+                self.action_std = torch.from_numpy(std).float().to(self.device)
+            else:
                 raise RuntimeError(
-                    "Checkpoint was trained with normalize_action=true; "
-                    "pass data_path so the policy can recompute the stats."
+                    "Checkpoint was trained with normalize_action=true but "
+                    "has no bundled action_mean/action_std, and no data_path "
+                    "was provided to recompute them. Either pass data_path "
+                    "or run retrofit_action_stats.py on the ckpt."
                 )
-            mean, std = _compute_action_stats(Path(data_path))
-            self.action_mean = torch.from_numpy(mean).float().to(self.device)
-            self.action_std = torch.from_numpy(std).float().to(self.device)
         else:
             self.action_mean = torch.zeros(self.action_dim_raw, device=self.device)
             self.action_std = torch.ones(self.action_dim_raw, device=self.device)

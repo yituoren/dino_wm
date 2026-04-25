@@ -7,7 +7,7 @@ class DinoV2Encoder(nn.Module):
     def __init__(self, name, feature_key):
         super().__init__()
         self.name = name
-        self.base_model = torch.hub.load("facebookresearch/dinov2", name)
+        self.base_model = torch.hub.load("facebookresearch/dinov2:4d83ffd4f4b39df112cef7ed7833de7ebf3a202e", name)
         self.feature_key = feature_key
         self.emb_dim = self.base_model.num_features
         if feature_key == "x_norm_patchtokens":

@@ -1,0 +1,30 @@
+# DINO-WM env config for per-task RoboTwin finetune splits.
+#
+# Layout (produced by lwm/scripts/preprocess_data.sh):
+#     <finetune_root>/<task>/<N>_episodes/<ep>/{frames,actions_raw}.npy
+#
+# run_finetune.sh exports FINETUNE_ROOT / FT_TASK / FT_SPLIT for each run so
+# this one config covers every (task, N) combination. Matches the layout
+# used by reference/oracle/config/train/data/robotwin_finetune.yaml.
+#
+# frameskip=1 for the same reason as env/robotwin.yaml: preprocess already
+# baked the raw HDF5 skip into the .npy stream, so the dataset windowing is
+# step-aligned.
+name: robotwin
+args: []
+kwargs: {}
+
+dataset:
+  _target_: "datasets.robotwin_dset.load_robotwin_slice_train_val"
+  data_path: ${oc.env:FINETUNE_ROOT}/${oc.env:FT_TASK}/${oc.env:FT_SPLIT}_episodes
+  normalize_action: ${normalize_action}
+  split_ratio: 0.9
+  n_rollout: null
+  transform:
+    _target_: "datasets.img_transforms.default_transform"
+    img_size: ${img_size}
+
+decoder_path: null
+# 1-episode splits have ~40 windows; big num_workers + persistent workers is
+# wasteful. Keep this modest.
+num_workers: 4

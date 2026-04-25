@@ -184,6 +184,17 @@ class Trainer:
                     ckpt[k] = self.accelerator.unwrap_model(self.__dict__[k])
                 else:
                     ckpt[k] = self.__dict__[k]
+            # Bake per-step action stats (mean/std over actions_raw[:,-1]) into
+            # the ckpt so eval-only machines don't need the finetune dataset
+            # on disk to recompute them. TrajSlicerDataset/TrajSubset forward
+            # attribute access to the underlying TrajDataset.
+            train_dset = self.datasets["train"]
+            base = getattr(train_dset, "dataset", train_dset)
+            mean = getattr(base, "action_mean", None)
+            std = getattr(base, "action_std", None)
+            if mean is not None and std is not None:
+                ckpt["action_mean"] = mean.detach().cpu().clone()
+                ckpt["action_std"] = std.detach().cpu().clone()
             torch.save(ckpt, "checkpoints/model_latest.pth")
             torch.save(ckpt, f"checkpoints/model_{self.epoch}.pth")
             log.info("Saved model to {}".format(os.getcwd()))
@@ -202,11 +213,65 @@ class Trainer:
         if len(not_in_ckpt):
             log.warning("Keys not found in ckpt: %s", not_in_ckpt)
 
+    def _load_finetune_weights(self, path):
+        """Load submodule weights from a pretrained ckpt at epoch 0.
+
+        ``save_ckpt`` pickles submodule *objects* (not state_dicts), so
+        rehydration is just stashing them back on ``self.__dict__`` -- the
+        guards added around the instantiate calls in ``init_models`` then
+        skip reinitialising anything we already populated. Optimizer state
+        and epoch are intentionally NOT carried over: finetune gets a
+        fresh optimizer with its own (lower) LR and starts from epoch 0.
+        """
+        # Load directly onto self.device, NOT cpu: ViTPredictor's Attention
+        # stashes its causal mask as a plain tensor attribute (`self.bias`,
+        # not register_buffer) at construction time, so neither `.to(device)`
+        # nor `accelerator.prepare` will migrate it later. map_location=cpu
+        # would leave that mask on CPU and crash mid-forward in masked_fill.
+        ckpt = torch.load(path, map_location=self.device)
+        wanted = ["encoder", "action_encoder", "proprio_encoder"]
+        if self.cfg.has_predictor:
+            wanted.append("predictor")
+        if self.cfg.has_decoder:
+            wanted.append("decoder")
+        loaded, missing = [], []
+        for k in wanted:
+            if k in ckpt and ckpt[k] is not None:
+                self.__dict__[k] = ckpt[k]
+                loaded.append(k)
+            else:
+                missing.append(k)
+        log.info(f"[finetune] from {path}  loaded={loaded}  missing={missing}")
+
+        # Fail fast if the dataset's per-step shape doesn't match the
+        # pretrained encoders. Most common cause: frameskip mismatch (the
+        # action chunk_dim is action_dim_raw * frameskip), which would
+        # otherwise blow up mid-forward with an opaque Conv1d shape error.
+        ds = self.datasets["train"]
+        if self.action_encoder is not None:
+            in_chans = getattr(self.action_encoder, "in_chans", None)
+            if in_chans is not None and in_chans != ds.action_dim:
+                raise ValueError(
+                    f"[finetune] action_encoder.in_chans={in_chans} but "
+                    f"dataset.action_dim={ds.action_dim}. Pretrain probably "
+                    f"used a different frameskip (chunk_dim = action_dim_raw "
+                    f"* frameskip). Set cfg.frameskip to match the pretrain."
+                )
+        if self.proprio_encoder is not None:
+            in_chans = getattr(self.proprio_encoder, "in_chans", None)
+            if in_chans is not None and in_chans != ds.proprio_dim:
+                raise ValueError(
+                    f"[finetune] proprio_encoder.in_chans={in_chans} but "
+                    f"dataset.proprio_dim={ds.proprio_dim}."
+                )
+
     def init_models(self):
         model_ckpt = Path(self.cfg.saved_folder) / "checkpoints" / "model_latest.pth"
         if model_ckpt.exists():
             self.load_ckpt(model_ckpt)
             log.info(f"Resuming from epoch {self.epoch}: {model_ckpt}")
+        elif self.cfg.get("finetune_from"):
+            self._load_finetune_weights(self.cfg.finetune_from)
 
         # initialize encoder
         if self.encoder is None:
@@ -217,20 +282,25 @@ class Trainer:
             for param in self.encoder.parameters():
                 param.requires_grad = False
 
-        self.proprio_encoder = hydra.utils.instantiate(
-            self.cfg.proprio_encoder,
-            in_chans=self.datasets["train"].proprio_dim,
-            emb_dim=self.cfg.proprio_emb_dim,
-        )
+        # Guard with `is None` so resume/finetune paths can preload the
+        # pickled module on self.{proprio_encoder,action_encoder} before
+        # entering init_models without getting clobbered here.
+        if self.proprio_encoder is None:
+            self.proprio_encoder = hydra.utils.instantiate(
+                self.cfg.proprio_encoder,
+                in_chans=self.datasets["train"].proprio_dim,
+                emb_dim=self.cfg.proprio_emb_dim,
+            )
         proprio_emb_dim = self.proprio_encoder.emb_dim
         print(f"Proprio encoder type: {type(self.proprio_encoder)}")
         self.proprio_encoder = self.accelerator.prepare(self.proprio_encoder)
 
-        self.action_encoder = hydra.utils.instantiate(
-            self.cfg.action_encoder,
-            in_chans=self.datasets["train"].action_dim,
-            emb_dim=self.cfg.action_emb_dim,
-        )
+        if self.action_encoder is None:
+            self.action_encoder = hydra.utils.instantiate(
+                self.cfg.action_encoder,
+                in_chans=self.datasets["train"].action_dim,
+                emb_dim=self.cfg.action_emb_dim,
+            )
         action_emb_dim = self.action_encoder.emb_dim
         print(f"Action encoder type: {type(self.action_encoder)}")
 
@@ -552,82 +622,83 @@ class Trainer:
                 self.logs_update(val_rollout_logs)
 
         self.accelerator.wait_for_everyone()
-        for i, data in enumerate(
-            tqdm(self.dataloaders["valid"], desc=f"Epoch {self.epoch} Valid")
-        ):
-            obs, act, state = data
-            plot = i == 0
-            self.model.eval()
-            z_out, visual_out, visual_reconstructed, loss, loss_components = self.model(
-                obs, act
-            )
-
-            loss = self.accelerator.gather_for_metrics(loss).mean()
-
-            loss_components = self.accelerator.gather_for_metrics(loss_components)
-            loss_components = {
-                key: value.mean().item() for key, value in loss_components.items()
-            }
-
-            if self.cfg.has_decoder and plot:
-                # only eval images when plotting due to speed
-                if self.cfg.has_predictor:
-                    z_obs_out, z_act_out = self.model.separate_emb(z_out)
-                    z_gt = self.model.encode_obs(obs)
-                    z_tgt = slice_trajdict_with_t(z_gt, start_idx=self.model.num_pred)
-
-                    state_tgt = state[:, -self.model.num_hist :]  # (b, num_hist, dim)
-                    err_logs = self.err_eval(z_obs_out, z_tgt)
-
-                    err_logs = self.accelerator.gather_for_metrics(err_logs)
-                    err_logs = {
-                        key: value.mean().item() for key, value in err_logs.items()
-                    }
-                    err_logs = {f"val_{k}": [v] for k, v in err_logs.items()}
-
-                    self.logs_update(err_logs)
-
-                if visual_out is not None:
-                    for t in range(
-                        self.cfg.num_hist, self.cfg.num_hist + self.cfg.num_pred
-                    ):
-                        img_pred_scores = eval_images(
-                            visual_out[:, t - self.cfg.num_pred], obs["visual"][:, t]
-                        )
-                        img_pred_scores = self.accelerator.gather_for_metrics(
-                            img_pred_scores
-                        )
-                        img_pred_scores = {
-                            f"val_img_{k}_pred": [v.mean().item()]
-                            for k, v in img_pred_scores.items()
-                        }
-                        self.logs_update(img_pred_scores)
-
-                if visual_reconstructed is not None:
-                    for t in range(obs["visual"].shape[1]):
-                        img_reconstruction_scores = eval_images(
-                            visual_reconstructed[:, t], obs["visual"][:, t]
-                        )
-                        img_reconstruction_scores = self.accelerator.gather_for_metrics(
-                            img_reconstruction_scores
-                        )
-                        img_reconstruction_scores = {
-                            f"val_img_{k}_reconstructed": [v.mean().item()]
-                            for k, v in img_reconstruction_scores.items()
-                        }
-                        self.logs_update(img_reconstruction_scores)
-
-                self.plot_samples(
-                    obs["visual"],
-                    visual_out,
-                    visual_reconstructed,
-                    self.epoch,
-                    batch=i,
-                    num_samples=self.num_reconstruct_samples,
-                    phase="valid",
+        with torch.no_grad():
+            for i, data in enumerate(
+                tqdm(self.dataloaders["valid"], desc=f"Epoch {self.epoch} Valid")
+            ):
+                obs, act, state = data
+                plot = i == 0
+                self.model.eval()
+                z_out, visual_out, visual_reconstructed, loss, loss_components = self.model(
+                    obs, act
                 )
-            loss_components = {f"val_{k}": [v] for k, v in loss_components.items()}
-            self.logs_update(loss_components)
+
+                loss = self.accelerator.gather_for_metrics(loss).mean()
+
+                loss_components = self.accelerator.gather_for_metrics(loss_components)
+                loss_components = {
+                    key: value.mean().item() for key, value in loss_components.items()
+                }
+
+                if self.cfg.has_decoder and plot:
+                    # only eval images when plotting due to speed
+                    if self.cfg.has_predictor:
+                        z_obs_out, z_act_out = self.model.separate_emb(z_out)
+                        z_gt = self.model.encode_obs(obs)
+                        z_tgt = slice_trajdict_with_t(z_gt, start_idx=self.model.num_pred)
+
+                        state_tgt = state[:, -self.model.num_hist :]  # (b, num_hist, dim)
+                        err_logs = self.err_eval(z_obs_out, z_tgt)
+
+                        err_logs = self.accelerator.gather_for_metrics(err_logs)
+                        err_logs = {
+                            key: value.mean().item() for key, value in err_logs.items()
+                        }
+                        err_logs = {f"val_{k}": [v] for k, v in err_logs.items()}
+
+                        self.logs_update(err_logs)
+
+                    if visual_out is not None:
+                        for t in range(
+                            self.cfg.num_hist, self.cfg.num_hist + self.cfg.num_pred
+                        ):
+                            img_pred_scores = eval_images(
+                                visual_out[:, t - self.cfg.num_pred], obs["visual"][:, t]
+                            )
+                            img_pred_scores = self.accelerator.gather_for_metrics(
+                                img_pred_scores
+                            )
+                            img_pred_scores = {
+                                f"val_img_{k}_pred": [v.mean().item()]
+                                for k, v in img_pred_scores.items()
+                            }
+                            self.logs_update(img_pred_scores)
+
+                    if visual_reconstructed is not None:
+                        for t in range(obs["visual"].shape[1]):
+                            img_reconstruction_scores = eval_images(
+                                visual_reconstructed[:, t], obs["visual"][:, t]
+                            )
+                            img_reconstruction_scores = self.accelerator.gather_for_metrics(
+                                img_reconstruction_scores
+                            )
+                            img_reconstruction_scores = {
+                                f"val_img_{k}_reconstructed": [v.mean().item()]
+                                for k, v in img_reconstruction_scores.items()
+                            }
+                            self.logs_update(img_reconstruction_scores)
+
+                    self.plot_samples(
+                        obs["visual"],
+                        visual_out,
+                        visual_reconstructed,
+                        self.epoch,
+                        batch=i,
+                        num_samples=self.num_reconstruct_samples,
+                        phase="valid",
+                    )
+                loss_components = {f"val_{k}": [v] for k, v in loss_components.items()}
+                self.logs_update(loss_components)
 
     def openloop_rollout(
         self, dset, num_rollout=10, rand_start_end=True, min_horizon=2, mode="train"
@@ -643,11 +714,31 @@ class Trainer:
         # rollout with both num_hist and 1 frame as context
         num_past = [(self.cfg.num_hist, ""), (1, "_1framestart")]
 
+        # Pre-filter to episodes that *can* satisfy the inner while-loop's
+        # `max_horizon > min_horizon` check. The check requires
+        #   T_ds >= (min_horizon + 1) * frameskip + 1
+        # so any shorter episode would spin the while-loop forever (it
+        # also re-reads the .npy frames each iteration -- looks like a
+        # hang). Common with N=1 finetune splits and frameskip>=4.
+        if rand_start_end:
+            min_T = (min_horizon + 1) * self.cfg.frameskip + 1
+            viable = [i for i in range(len(dset))
+                      if dset.get_seq_length(i) >= min_T]
+            if not viable:
+                log.info(
+                    f"[rollout/{mode}] no episodes >= {min_T} steps "
+                    f"(num_hist={self.cfg.num_hist}, frameskip="
+                    f"{self.cfg.frameskip}); skipping openloop_rollout"
+                )
+                return {}
+        else:
+            viable = list(range(len(dset)))
+
         # sample traj
         for idx in range(num_rollout):
             valid_traj = False
             while not valid_traj:
-                traj_idx = np.random.randint(0, len(dset))
+                traj_idx = viable[np.random.randint(0, len(viable))]
                 obs, act, state, _ = dset[traj_idx]
                 act = act.to(self.device)
                 if rand_start_end:

@@ -32,7 +32,12 @@ import numpy as np
 import torch
 from einops import rearrange
 
-from .traj_dset import TrajDataset, get_train_val_sliced
+from .traj_dset import (
+    TrajDataset,
+    TrajSlicerDataset,
+    TrajSubset,
+    get_train_val_sliced,
+)
 
 
 class RoboTwinPreprocessedDataset(TrajDataset):
@@ -168,12 +173,34 @@ def load_robotwin_slice_train_val(
         normalize_action=normalize_action,
         n_rollout=n_rollout,
     )
-    dset_train, dset_val, train_slices, val_slices = get_train_val_sliced(
-        traj_dataset=dset,
-        train_fraction=split_ratio,
-        num_frames=num_hist + num_pred,
-        frameskip=frameskip,
-    )
+
+    N = len(dset)
+    num_frames = num_hist + num_pred
+
+    if N == 1:
+        # Tiny finetune split: share the single episode between train and
+        # val. The default split_ratio=0.9 would otherwise put all episodes
+        # in val (int(0.9*1)=0), leaving train empty -> empty dataloader
+        # -> None batches in train(). No real holdout here -- val loss
+        # measures train-set fit, not generalization.
+        idx = list(range(N))
+        dset_train = TrajSubset(dset, idx)
+        dset_val = TrajSubset(dset, idx)
+        train_slices = TrajSlicerDataset(dset_train, num_frames, frameskip)
+        val_slices = TrajSlicerDataset(dset_val, num_frames, frameskip)
+    else:
+        # Clamp so neither half is empty regardless of split_ratio. With
+        # the default ratio=0.9 and N>=2 this is a no-op; the clamp matters
+        # only at extreme ratios (~0 or ~1) or pathological N.
+        n_train = max(1, min(N - 1, int(split_ratio * N)))
+        eff_ratio = n_train / N
+        dset_train, dset_val, train_slices, val_slices = get_train_val_sliced(
+            traj_dataset=dset,
+            train_fraction=eff_ratio,
+            num_frames=num_frames,
+            frameskip=frameskip,
+        )
+
     datasets = {"train": train_slices, "valid": val_slices}
     traj_dset = {"train": dset_train, "valid": dset_val}
     return datasets, traj_dset
