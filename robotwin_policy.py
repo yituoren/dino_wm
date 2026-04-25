@@ -95,9 +95,18 @@ def _load_model_from_ckpt(
         # baseline package dir.
         pass
 
+    # train.py:save_ckpt only pickles modules that are *being trained*
+    # (encoder/decoder are skipped when train_encoder/train_decoder=False),
+    # so the encoder is typically absent from finetune ckpts. Rebuild it
+    # from cfg.encoder the same way train.py:init_models does -- DINO
+    # weights pull from torch hub deterministically, so no state to load.
+    encoder = modules.get("encoder")
+    if encoder is None:
+        encoder = hydra.utils.instantiate(cfg.encoder).to(device)
+
     model = hydra.utils.instantiate(
         cfg.model,
-        encoder=modules["encoder"],
+        encoder=encoder,
         proprio_encoder=modules["proprio_encoder"],
         action_encoder=modules["action_encoder"],
         predictor=modules["predictor"],
@@ -187,8 +196,13 @@ class DINOWMRoboTwinPolicy:
         if goal_image_path is not None:
             self.load_goal_image(goal_image_path)
 
-        self.frame_history: deque = deque(maxlen=self.num_hist)
-        self.action_history: deque = deque(maxlen=self.num_hist)
+        # All three buffers advance one slot per get_action call. With
+        # frameskip>1, each get_action call commits `frameskip` raw env
+        # actions and the next call observes a single new (pix, qpos) --
+        # which matches one slot in the dataset's stride=frameskip view.
+        self.frame_history: deque = deque(maxlen=self.num_hist)         # 14-d=A_raw not used; pixels
+        self.proprio_history: deque = deque(maxlen=self.num_hist)        # 14-d normalized qpos
+        self.action_history: deque = deque(maxlen=self.num_hist)         # 56-d normalized chunk that was committed
 
     # --------------------------------------------------------- goal bank
     @torch.no_grad()
@@ -263,6 +277,7 @@ class DINOWMRoboTwinPolicy:
     # ------------------------------------------------------- deploy API
     def reset_obs(self) -> None:
         self.frame_history.clear()
+        self.proprio_history.clear()
         self.action_history.clear()
 
     def update_obs(self, obs: Mapping) -> None:
@@ -284,29 +299,33 @@ class DINOWMRoboTwinPolicy:
 
         qpos = torch.from_numpy(self._current_qpos(obs)).to(self.device)
         qpos_norm = (qpos - self.action_mean) / self.action_std
-        # proprio is the same setpoint proxy used at training time
-        self.action_history.append(qpos_norm)
+        self.proprio_history.append(qpos_norm)
 
         pixels_hist = torch.stack(self._pad_history(self.frame_history, current_pix), dim=0)
-        proprio_hist = torch.stack(self._pad_history(self.action_history, qpos_norm), dim=0)
+        proprio_hist = torch.stack(self._pad_history(self.proprio_history, qpos_norm), dim=0)
 
         K = self.planning_iters
         H = self.num_hist
         T_plan = self.planning_horizon
+        A_chunk = self.action_dim_per_step  # = action_dim_raw * frameskip
 
-        # (K, H, 3, S, S) + (K, H, A)
+        # (K, H, 3, S, S) + (K, H, A_raw=14)
         pixels_batch = pixels_hist.unsqueeze(0).expand(K, -1, -1, -1, -1).contiguous()
         proprio_batch = proprio_hist.unsqueeze(0).expand(K, -1, -1).contiguous()
         obs_0 = {"visual": pixels_batch, "proprio": proprio_batch}
 
-        # Past actions for the first num_hist steps come from history too;
-        # candidate actions are sampled Gaussian in the *normalized* space
-        # so action_scale is in std units. Denormalize before dispatch.
-        past_act = torch.stack(self._pad_history(self.action_history, qpos_norm), dim=0)
-        past_act = past_act.unsqueeze(0).expand(K, -1, -1).contiguous()      # (K, H, A)
+        # Past actions are the chunks (frameskip raw actions concat'd) we
+        # actually committed in prior get_action calls. Pad with zero-chunks
+        # for the warmup steps where we don't have history yet -- mirrors
+        # the LeWM analog and matches the dataset's normalized-zero default.
+        zero_chunk = torch.zeros(A_chunk, device=self.device)
+        past_chunks = self._pad_history(self.action_history, zero_chunk)
+        past_act = torch.stack(past_chunks, dim=0).unsqueeze(0).expand(K, -1, -1).contiguous()
 
-        cand = torch.randn(K, T_plan, self.action_dim_raw, device=self.device) * self.action_scale
-        act_batch = torch.cat([past_act, cand], dim=1)                       # (K, H + T_plan, A)
+        # Candidate chunks live in normalized space (action_scale is std-units);
+        # denormalize per-raw-step before dispatching to env.
+        cand = torch.randn(K, T_plan, A_chunk, device=self.device) * self.action_scale
+        act_batch = torch.cat([past_act, cand], dim=1)                       # (K, H + T_plan, A_chunk)
 
         z_obses, _ = self.model.rollout(obs_0, act_batch)
         # z_obses['visual']: (K, H + T_plan + 1, P, D)
@@ -315,11 +334,13 @@ class DINOWMRoboTwinPolicy:
         cost = ((z_final - z_goal) ** 2).mean(dim=(1, 2, 3))                 # (K,)
 
         best = int(cost.argmin().item())
-        first_norm = cand[best, 0]                                           # (A,)
-        first = first_norm * self.action_std + self.action_mean              # denormalize
-        action_np = first.detach().cpu().numpy().astype(np.float32)
+        best_chunk_norm = cand[best, 0].detach()                             # (A_chunk,)
+        # Log the committed (normalized) chunk so next call's history is correct.
+        self.action_history.append(best_chunk_norm.clone())
 
-        # Log the *normalized* action we just committed into history so the
-        # next step's proprio matches training-time convention.
-        self.action_history[-1] = first_norm.detach()
-        return [action_np]
+        # Split the chunk back into `frameskip` raw 14-d actions and
+        # denormalize per step (action_mean/std are 14-d per-step stats).
+        per_step_norm = best_chunk_norm.view(self.frameskip, self.action_dim_raw)
+        per_step = per_step_norm * self.action_std + self.action_mean
+        return [per_step[i].cpu().numpy().astype(np.float32)
+                for i in range(self.frameskip)]

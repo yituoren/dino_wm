@@ -8,19 +8,21 @@ Reads the per-episode dump produced by ``sdlwm.data.preprocess`` (see
         actions_raw.npy   (T_ds, fs, A)  float32  -- repeat-last-pad setpoints
         meta.json
 
-We expose the *downsampled* stream directly (one dataset step == one
-preprocessed frame), so the DINO-WM config should run with ``frameskip=1``
-even though the underlying HDF5 used a real skip of 5 -- that skip has
-already been baked into the .npy files. ``TrajSlicerDataset`` then does
-the standard ``(num_frames)`` windowing on top.
+Each preprocessed frame holds ``fs`` action setpoints between it and the
+next frame. To preserve the full setpoint trajectory inside an action
+chunk (instead of throwing 3/4 of them away by taking ``[:, -1]``), we
+*expand* the stream: each visual frame is broadcast ``fs`` times and the
+action tensor is flattened to ``(T_ds * fs, A)`` -- one row per raw
+setpoint. ``TrajSlicerDataset`` is then run with ``frameskip=fs`` over
+the expanded stream, so it strides visuals by ``fs`` (one per original
+preprocessed frame) and concats ``fs`` consecutive setpoints into the
+``fs * A``-d action chunk per model step. Net effect: same per-model-step
+temporal granularity as before, but action chunks now contain the real
+intra-skip trajectory rather than ``fs`` copies of last-of-skip.
 
-Per-step action is ``actions_raw[:, -1]`` (last-of-skip -- the legal
-drive_target setpoint that advances to the next sampled frame), matching
-what SD-LWM's ``FinetuneEpisodeDataset`` uses.
-
-Proprio / state are set to the same setpoint vector: we don't save real
-qpos during preprocess, and the drive_target is an adequate proxy for
-a JEPA-style predictor that treats proprio as an auxiliary token.
+Proprio / state mirror the action stream: we don't save real qpos during
+preprocess, and the drive_target setpoint is an adequate proxy for a
+JEPA-style predictor that treats proprio as an auxiliary token.
 """
 from __future__ import annotations
 
@@ -53,7 +55,7 @@ class RoboTwinPreprocessedDataset(TrajDataset):
         self.normalize_action = normalize_action
 
         episodes: list[Path] = []
-        seq_lengths: list[int] = []
+        ds_lengths: list[int] = []
         action_dim: int | None = None
         for ep in sorted(p for p in self.data_path.iterdir() if p.is_dir()):
             meta_path = ep / "meta.json"
@@ -72,22 +74,27 @@ class RoboTwinPreprocessedDataset(TrajDataset):
             if action_dim is None:
                 action_dim = int(meta.get("action_dim", 0)) or None
             episodes.append(ep)
-            seq_lengths.append(T)
+            ds_lengths.append(T)
 
         if n_rollout is not None:
             episodes = episodes[:n_rollout]
-            seq_lengths = seq_lengths[:n_rollout]
+            ds_lengths = ds_lengths[:n_rollout]
 
         if not episodes:
             raise RuntimeError(
                 f"RoboTwinPreprocessedDataset: no usable episodes under {self.data_path}"
             )
+        # Sniff (fs, A) from the first file. We assume fs is constant across
+        # episodes (preprocess.py writes a single FRAME_SKIP for the whole run).
+        head = np.load(episodes[0] / "actions_raw.npy", mmap_mode="r")
+        self.fs = int(head.shape[1])
         if action_dim is None:
-            # meta.json predates action_dim field -- sniff from the first file
-            action_dim = int(np.load(episodes[0] / "actions_raw.npy", mmap_mode="r").shape[-1])
+            action_dim = int(head.shape[-1])
 
         self._episodes = episodes
-        self._seq_lengths = seq_lengths
+        # Expanded length = preprocessed frames * fs (one row per raw setpoint
+        # after broadcast). This is what get_seq_length / TrajSlicer see.
+        self._seq_lengths = [T * self.fs for T in ds_lengths]
 
         self.action_dim = int(action_dim)
         self.proprio_dim = int(action_dim)
@@ -106,10 +113,13 @@ class RoboTwinPreprocessedDataset(TrajDataset):
     def _compute_action_stats(self) -> tuple[torch.Tensor, torch.Tensor]:
         if not self.normalize_action:
             return torch.zeros(self.action_dim), torch.ones(self.action_dim)
+        # Stats are over every raw setpoint we will actually feed the model
+        # (after broadcast each row of the flattened (T*fs, A) stream is a
+        # training step), not just last-of-skip.
         chunks = []
         for ep in self._episodes:
             raw = np.load(ep / "actions_raw.npy", mmap_mode="r")  # (T, fs, A)
-            chunks.append(np.asarray(raw[:, -1], dtype=np.float32))
+            chunks.append(np.asarray(raw, dtype=np.float32).reshape(-1, raw.shape[-1]))
         cat = np.concatenate(chunks, axis=0)
         mean = torch.from_numpy(cat.mean(axis=0)).float()
         std = torch.from_numpy(np.clip(cat.std(axis=0), 1e-6, None)).float()
@@ -123,15 +133,23 @@ class RoboTwinPreprocessedDataset(TrajDataset):
 
     def __getitem__(self, idx: int):
         ep = self._episodes[idx]
-        frames = np.load(ep / "frames.npy")                          # (T, 3, H, W) uint8
-        actions_raw = np.load(ep / "actions_raw.npy")                # (T, fs, A)
-        actions = np.ascontiguousarray(actions_raw[:, -1])           # (T, A) last-of-skip
+        frames = np.load(ep / "frames.npy")                          # (T_ds, 3, H, W) uint8
+        actions_raw = np.load(ep / "actions_raw.npy")                # (T_ds, fs, A)
+        fs = int(actions_raw.shape[1])
+
+        # Broadcast each preprocessed frame fs times so the visual stream
+        # length matches the flattened action stream. TrajSlicer with
+        # frameskip=fs will then stride visuals by fs (-> one per original
+        # preprocessed frame) while concat'ing fs raw setpoints into the
+        # action chunk per model step.
+        frames = np.repeat(frames, fs, axis=0)                       # (T_ds*fs, 3, H, W)
+        actions = actions_raw.reshape(-1, actions_raw.shape[-1])     # (T_ds*fs, A)
 
         image = torch.from_numpy(np.ascontiguousarray(frames).astype(np.float32) / 255.0)
         if self.transform is not None:
             image = self.transform(image)
 
-        act = torch.from_numpy(actions.astype(np.float32))
+        act = torch.from_numpy(np.ascontiguousarray(actions.astype(np.float32)))
         act = (act - self.action_mean) / self.action_std
         proprio = act.clone()
         state = act.clone()
@@ -162,10 +180,12 @@ def load_robotwin_slice_train_val(
 ):
     """Entry point referenced by ``conf/env/robotwin.yaml`` via ``_target_``.
 
-    ``frameskip`` is the DINO-WM window stride over the *preprocessed*
-    episode -- the raw HDF5 skip is already baked in, so set this to 1 in
-    the config unless you actually want to sub-sample the .npy files
-    further (rarely useful).
+    ``frameskip`` is the DINO-WM window stride over the *expanded* stream
+    (each preprocessed frame broadcast ``fs`` times -- see module docstring).
+    Set ``frameskip = fs`` (= the FRAME_SKIP used at preprocess time, 4 by
+    default in scripts/preprocess_data.sh) so visual stride lands on every
+    original frame and the action chunk holds one full intra-skip
+    trajectory per model step.
     """
     dset = RoboTwinPreprocessedDataset(
         data_path=data_path,
