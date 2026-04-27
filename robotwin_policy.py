@@ -1,10 +1,19 @@
 """DINO-WM inference wrapper for RoboTwin closed-loop eval.
 
 Rehydrates the VWorldModel from a training checkpoint + its saved hydra
-config (``<saved_folder>/hydra.yaml``), then drives it with random-shooting
-MPC the same way ``reference/oracle/lewm_policy.py`` drives the JEPA
-baseline. Exposes the ``reset_obs / update_obs / get_action`` contract that
-``RoboTwin/policy/DINOWM/deploy_policy.py`` forwards to.
+config (``<saved_folder>/hydra.yaml``), then drives it with the *original*
+DINO-WM planner from ``planning/`` (CEMPlanner or GDPlanner) instead of an
+ad-hoc random-shooting loop. Exposes the ``reset_obs / update_obs /
+get_action`` contract that ``RoboTwin/policy/DINOWM/deploy_policy.py``
+forwards to.
+
+The original DINO-WM planners assume ``obs_0['visual'].shape[1] == 1`` (a
+single first observation per traj) -- their offline plan.py prepares
+targets that way. RoboTwin's online MPC instead carries num_hist past
+obs/proprio frames, so we wrap the world model in ``_RolloutAdapter``
+that prepends the stored past actions inside ``rollout(obs_0, act)``
+before delegating to the real ``VWorldModel.rollout``. The planner is
+unmodified.
 
 Key shape contract matches the dataset at ``datasets/robotwin_dset.py``:
   * Visuals: (T, 3, img_size, img_size) float, Normalize(0.5, 0.5) -> [-1, 1]
@@ -14,8 +23,7 @@ Key shape contract matches the dataset at ``datasets/robotwin_dset.py``:
 
 Action_dim in the checkpoint already includes the DINO-WM fs-concat factor
 (``dataset.action_dim * frameskip``), so a config trained with frameskip=1
-yields action_dim=14 for aloha-agilex. Higher frameskip would mean each
-MPC step commits ``frameskip`` qpos setpoints; we currently assume =1.
+yields action_dim=14 for aloha-agilex.
 """
 from __future__ import annotations
 
@@ -29,7 +37,6 @@ from typing import Mapping
 import numpy as np
 import torch
 from omegaconf import OmegaConf
-from torchvision import transforms
 
 
 _MODEL_KEYS = ("encoder", "predictor", "decoder", "proprio_encoder", "action_encoder")
@@ -77,29 +84,14 @@ def _load_model_from_ckpt(
     the VWorldModel wrapper.
     """
     import hydra
-    from hydra.core.global_hydra import GlobalHydra
 
     cfg = OmegaConf.load(str(hydra_cfg_path))
 
     ckpt = torch.load(str(ckpt_path), map_location=device)
     modules = {k: ckpt[k].to(device) for k in _MODEL_KEYS if k in ckpt and ckpt[k] is not None}
-    # train.py:save_ckpt bundles per-step action_mean/action_std (1-D tensors,
-    # length = dataset.action_dim_raw) so eval-only machines don't need the
-    # finetune dataset on disk just to recompute normalization stats.
     bundled_mean = ckpt.get("action_mean")
     bundled_std = ckpt.get("action_std")
 
-    if not GlobalHydra.instance().is_initialized():
-        # allow hydra.utils.instantiate to resolve relative _target_ strings
-        # (e.g. "datasets.img_transforms.default_transform") from the
-        # baseline package dir.
-        pass
-
-    # train.py:save_ckpt only pickles modules that are *being trained*
-    # (encoder/decoder are skipped when train_encoder/train_decoder=False),
-    # so the encoder is typically absent from finetune ckpts. Rebuild it
-    # from cfg.encoder the same way train.py:init_models does -- DINO
-    # weights pull from torch hub deterministically, so no state to load.
     encoder = modules.get("encoder")
     if encoder is None:
         encoder = hydra.utils.instantiate(cfg.encoder).to(device)
@@ -124,8 +116,75 @@ def _load_model_from_ckpt(
     return model, cfg, bundled_mean, bundled_std
 
 
+# --------------------------------------------------------- planner stubs
+
+class _NullWandb:
+    """Minimal stub matching the wandb_run.log contract used by the planners."""
+    def log(self, *args, **kwargs):
+        return
+
+
+class _IdentityPreprocessor:
+    """Pass-through preprocessor.
+
+    The wrapper already converts RoboTwin observations into the model's
+    input space (pixels in [-1, 1], proprio normalized) before they reach
+    the planner, so the planner-side preprocessor is just an identity over
+    obs and a no-op over actions (only used by GDPlanner's sample_type=
+    'zero' branch, which we don't trigger).
+    """
+    def transform_obs(self, obs):
+        return obs
+
+    def normalize_actions(self, actions):
+        return actions
+
+    def denormalize_actions(self, actions):
+        return actions
+
+
+class _RolloutAdapter:
+    """Wraps the DINO-WM world model so the original CEM/GD planners can
+    drive online MPC over a num_hist-long observation window.
+
+    The original ``VWorldModel.rollout(obs_0, act)`` reads
+    ``num_obs_init = obs_0['visual'].shape[1]`` and treats
+    ``act[:, :num_obs_init]`` as the past actions paired with each frame.
+    Our planners only sample the *future* action sequence, so this adapter
+    holds the past actions externally and prepends them inside ``rollout``
+    before delegating. ``encode_obs`` is a passthrough.
+
+    Set ``past_act`` (shape ``(B, num_hist, action_dim)``) before each
+    planner call; the adapter expands it to match the candidate batch.
+    """
+
+    def __init__(self, wm: torch.nn.Module):
+        self.wm = wm
+        self.past_act: torch.Tensor | None = None  # (1, num_hist, A_chunk)
+
+    @property
+    def num_hist(self) -> int:
+        return int(self.wm.num_hist)
+
+    def parameters(self):
+        return self.wm.parameters()
+
+    def encode_obs(self, obs):
+        return self.wm.encode_obs(obs)
+
+    def rollout(self, obs_0, act):
+        if self.past_act is None:
+            raise RuntimeError("_RolloutAdapter.past_act must be set before rollout")
+        B = act.shape[0]
+        past = self.past_act.expand(B, -1, -1).to(act.dtype)
+        full = torch.cat([past, act], dim=1)
+        return self.wm.rollout(obs_0, full)
+
+
+# --------------------------------------------------------------- policy
+
 class DINOWMRoboTwinPolicy:
-    """Random-shooting MPC driver for a trained DINO-WM VWorldModel."""
+    """CEM/Adam-MPC driver for a trained DINO-WM VWorldModel."""
 
     def __init__(
         self,
@@ -137,9 +196,19 @@ class DINOWMRoboTwinPolicy:
         task_name: str | None = None,
         camera_key: str = "head_camera",
         device: str | torch.device = "cuda",
+        solver: str = "cem",
         planning_horizon: int = 5,
-        planning_iters: int = 100,
-        action_scale: float = 1.0,
+        # CEM knobs (mirror conf/planner/cem.yaml defaults from the original repo).
+        cem_num_samples: int = 300,
+        cem_topk: int = 30,
+        cem_var_scale: float = 1.0,
+        cem_opt_steps: int = 30,
+        # GD knobs (mirror conf/planner/gd.yaml).
+        gd_lr: float = 0.1,
+        gd_action_noise: float = 0.0,
+        gd_opt_steps: int = 30,
+        gd_sample_type: str = "randn",
+        objective_alpha: float = 1.0,
     ):
         self.device = torch.device(device) if not isinstance(device, torch.device) else device
         self.camera_key = camera_key
@@ -147,8 +216,9 @@ class DINOWMRoboTwinPolicy:
         self._task_name_hint = task_name
         self._seeds_cache: dict[Path, set[int]] = {}
 
-        # Make sure ``import datasets`` / ``import models`` used by the
-        # hydra targets inside the ckpt resolve to the baseline package.
+        # Make sure ``import datasets`` / ``import models`` / ``import planning``
+        # used by the hydra targets and the planner imports resolve to the
+        # baseline package.
         baseline_root = Path(__file__).resolve().parent
         if str(baseline_root) not in sys.path:
             sys.path.insert(0, str(baseline_root))
@@ -159,19 +229,11 @@ class DINOWMRoboTwinPolicy:
         self.img_size = int(self.cfg.img_size)
         self.num_hist = int(self.cfg.num_hist)
         self.frameskip = int(self.cfg.frameskip)
-        # action_dim stored in the model already accounts for fs-concat.
         self.action_dim_per_step = int(self.model.action_encoder.in_chans)
         self.action_dim_raw = self.action_dim_per_step // self.frameskip
 
         self.planning_horizon = int(planning_horizon)
-        self.planning_iters = int(planning_iters)
-        self.action_scale = float(action_scale)
 
-        # Action normalization stats (match the dataset's normalize_action).
-        # Prefer ckpt-bundled stats (saved by train.py:save_ckpt), fall back
-        # to recomputing from data_path. The latter only matters for old
-        # ckpts saved before stat-baking; retrofit_action_stats.py can
-        # backfill them in-place if needed.
         self.normalize_action = bool(self.cfg.get("normalize_action", False))
         if self.normalize_action:
             if bundled_mean is not None and bundled_std is not None:
@@ -185,24 +247,71 @@ class DINOWMRoboTwinPolicy:
                 raise RuntimeError(
                     "Checkpoint was trained with normalize_action=true but "
                     "has no bundled action_mean/action_std, and no data_path "
-                    "was provided to recompute them. Either pass data_path "
-                    "or run retrofit_action_stats.py on the ckpt."
+                    "was provided to recompute them."
                 )
         else:
             self.action_mean = torch.zeros(self.action_dim_raw, device=self.device)
             self.action_std = torch.ones(self.action_dim_raw, device=self.device)
 
+        # --- planner setup (mirrors planning/cem.py + planning/gd.py) ----
+        from planning.cem import CEMPlanner
+        from planning.gd import GDPlanner
+        from planning.objectives import create_objective_fn
+
+        self._wm_adapter = _RolloutAdapter(self.model)
+        self._objective_fn = create_objective_fn(
+            alpha=float(objective_alpha), base=1.0, mode="last"
+        )
+        self._wandb = _NullWandb()
+        self._preprocessor = _IdentityPreprocessor()
+
+        solver = solver.lower()
+        if solver == "cem":
+            self._planner = CEMPlanner(
+                horizon=self.planning_horizon,
+                topk=int(cem_topk),
+                num_samples=int(cem_num_samples),
+                var_scale=float(cem_var_scale),
+                opt_steps=int(cem_opt_steps),
+                eval_every=10**9,  # never trigger the evaluator branch
+                wm=self._wm_adapter,
+                action_dim=self.action_dim_per_step,
+                objective_fn=self._objective_fn,
+                preprocessor=self._preprocessor,
+                evaluator=None,
+                wandb_run=self._wandb,
+                logging_prefix="robotwin_cem",
+                log_filename=None,
+            )
+        elif solver in ("gd", "adam", "sgd"):
+            self._planner = GDPlanner(
+                horizon=self.planning_horizon,
+                action_noise=float(gd_action_noise),
+                sample_type=gd_sample_type,
+                lr=float(gd_lr),
+                opt_steps=int(gd_opt_steps),
+                eval_every=10**9,
+                wm=self._wm_adapter,
+                action_dim=self.action_dim_per_step,
+                objective_fn=self._objective_fn,
+                preprocessor=self._preprocessor,
+                evaluator=None,
+                wandb_run=self._wandb,
+                logging_prefix="robotwin_gd",
+                log_filename=None,
+            )
+        else:
+            raise ValueError(f"unknown solver={solver!r}; expected 'cem' or 'gd'")
+        self.solver = solver
+
         self.z_goal_visual: torch.Tensor | None = None
+        self._obs_g: dict | None = None
         if goal_image_path is not None:
             self.load_goal_image(goal_image_path)
 
-        # All three buffers advance one slot per get_action call. With
-        # frameskip>1, each get_action call commits `frameskip` raw env
-        # actions and the next call observes a single new (pix, qpos) --
-        # which matches one slot in the dataset's stride=frameskip view.
-        self.frame_history: deque = deque(maxlen=self.num_hist)         # 14-d=A_raw not used; pixels
-        self.proprio_history: deque = deque(maxlen=self.num_hist)        # 14-d normalized qpos
-        self.action_history: deque = deque(maxlen=self.num_hist)         # 56-d normalized chunk that was committed
+        self.frame_history: deque = deque(maxlen=self.num_hist)
+        self.proprio_history: deque = deque(maxlen=self.num_hist)
+        self.action_history: deque = deque(maxlen=self.num_hist)
 
     # --------------------------------------------------------- goal bank
     @torch.no_grad()
@@ -214,6 +323,7 @@ class DINOWMRoboTwinPolicy:
         }
         z = self.model.encode_obs(obs_g)
         self.z_goal_visual = z["visual"]                            # (1, 1, P, D)
+        self._obs_g = obs_g
 
     def load_goal_image(self, path: str | Path) -> None:
         from PIL import Image
@@ -264,10 +374,8 @@ class DINOWMRoboTwinPolicy:
         return items
 
     def _current_qpos(self, obs: Mapping) -> np.ndarray:
-        """Pull 14-d qpos from the RoboTwin observation dict."""
         if "joint_action" in obs and "vector" in obs["joint_action"]:
             return np.asarray(obs["joint_action"]["vector"], dtype=np.float32)
-        # Fall back: some task wrappers hand us a flat action vector already.
         if "qpos" in obs:
             return np.asarray(obs["qpos"], dtype=np.float32)
         raise KeyError(
@@ -281,18 +389,16 @@ class DINOWMRoboTwinPolicy:
         self.action_history.clear()
 
     def update_obs(self, obs: Mapping) -> None:
-        """Sample-level hook -- the MPC re-plans every step, so no buffering."""
         return
 
-    @torch.no_grad()
     def get_action(self, obs: Mapping) -> list[np.ndarray]:
-        if self.z_goal_visual is None:
+        if self.z_goal_visual is None or self._obs_g is None:
             raise RuntimeError(
                 "get_action called before a goal was loaded. Use "
                 "load_goal_image / load_goal_for_seed first."
             )
 
-        # --- assemble history of observed (visual, proprio) ----------
+        # --- assemble history ---------------------------------------------
         rgb = obs["observation"][self.camera_key]["rgb"]
         current_pix = _preprocess_rgb(np.asarray(rgb), self.img_size).to(self.device)
         self.frame_history.append(current_pix)
@@ -301,45 +407,42 @@ class DINOWMRoboTwinPolicy:
         qpos_norm = (qpos - self.action_mean) / self.action_std
         self.proprio_history.append(qpos_norm)
 
-        pixels_hist = torch.stack(self._pad_history(self.frame_history, current_pix), dim=0)
-        proprio_hist = torch.stack(self._pad_history(self.proprio_history, qpos_norm), dim=0)
+        pixels_hist = torch.stack(
+            self._pad_history(self.frame_history, current_pix), dim=0
+        )  # (H, 3, S, S)
+        proprio_hist = torch.stack(
+            self._pad_history(self.proprio_history, qpos_norm), dim=0
+        )  # (H, A_raw)
 
-        K = self.planning_iters
-        H = self.num_hist
-        T_plan = self.planning_horizon
-        A_chunk = self.action_dim_per_step  # = action_dim_raw * frameskip
-
-        # (K, H, 3, S, S) + (K, H, A_raw=14)
-        pixels_batch = pixels_hist.unsqueeze(0).expand(K, -1, -1, -1, -1).contiguous()
-        proprio_batch = proprio_hist.unsqueeze(0).expand(K, -1, -1).contiguous()
-        obs_0 = {"visual": pixels_batch, "proprio": proprio_batch}
-
-        # Past actions are the chunks (frameskip raw actions concat'd) we
-        # actually committed in prior get_action calls. Pad with zero-chunks
-        # for the warmup steps where we don't have history yet -- mirrors
-        # the LeWM analog and matches the dataset's normalized-zero default.
-        zero_chunk = torch.zeros(A_chunk, device=self.device)
+        zero_chunk = torch.zeros(self.action_dim_per_step, device=self.device)
         past_chunks = self._pad_history(self.action_history, zero_chunk)
-        past_act = torch.stack(past_chunks, dim=0).unsqueeze(0).expand(K, -1, -1).contiguous()
+        past_act = torch.stack(past_chunks, dim=0).unsqueeze(0).contiguous()  # (1, H, A_chunk)
 
-        # Candidate chunks live in normalized space (action_scale is std-units);
-        # denormalize per-raw-step before dispatching to env.
-        cand = torch.randn(K, T_plan, A_chunk, device=self.device) * self.action_scale
-        act_batch = torch.cat([past_act, cand], dim=1)                       # (K, H + T_plan, A_chunk)
+        # --- planner inputs (B=1) ----------------------------------------
+        obs_0 = {
+            "visual": pixels_hist.unsqueeze(0),                     # (1, H, 3, S, S)
+            "proprio": proprio_hist.unsqueeze(0),                   # (1, H, A_raw)
+        }
+        # The planner reads obs_g['visual'].shape only to derive z_obs_g via
+        # ``wm.encode_obs``; the rest of obs_g is ignored after encoding.
+        # We supply a (1, 1, ...) goal frame, matching the original eval shape.
+        obs_g = self._obs_g
 
-        z_obses, _ = self.model.rollout(obs_0, act_batch)
-        # z_obses['visual']: (K, H + T_plan + 1, P, D)
-        z_final = z_obses["visual"][:, -1:]                                  # (K, 1, P, D)
-        z_goal = self.z_goal_visual.expand(K, -1, -1, -1)                    # (K, 1, P, D)
-        cost = ((z_final - z_goal) ** 2).mean(dim=(1, 2, 3))                 # (K,)
+        # Stash past actions so the rollout adapter can reconstruct
+        # ``act_full = [past_act, sampled_future]`` inside ``wm.rollout``.
+        self._wm_adapter.past_act = past_act
 
-        best = int(cost.argmin().item())
-        best_chunk_norm = cand[best, 0].detach()                             # (A_chunk,)
-        # Log the committed (normalized) chunk so next call's history is correct.
+        try:
+            actions, _ = self._planner.plan(obs_0=obs_0, obs_g=obs_g, actions=None)
+        finally:
+            self._wm_adapter.past_act = None
+
+        # CEMPlanner returns the running mean (B, T_plan, A_chunk); GDPlanner
+        # returns the optimized actions (n_evals, T_plan, A_chunk). For
+        # n_evals=1 we pull the first traj's first chunk and execute it.
+        best_chunk_norm = actions[0, 0].detach()                       # (A_chunk,)
         self.action_history.append(best_chunk_norm.clone())
 
-        # Split the chunk back into `frameskip` raw 14-d actions and
-        # denormalize per step (action_mean/std are 14-d per-step stats).
         per_step_norm = best_chunk_norm.view(self.frameskip, self.action_dim_raw)
         per_step = per_step_norm * self.action_std + self.action_mean
         return [per_step[i].cpu().numpy().astype(np.float32)

@@ -1,9 +1,10 @@
 """DINO-WM eval client: iterates curated seeds under a goal bank.
 
-Drives the random-shooting MPC planner from ``robotwin_policy.DINOWMRoboTwinPolicy``
-(same directory) against a ``RoboTwin/script/eval_env_server.py`` running
-in a separate process. Connects via the length-prefixed JSON protocol in
-the vendored ``eval_protocol.py``.
+Drives the original DINO-WM CEM/Adam planner via ``robotwin_policy.\
+DINOWMRoboTwinPolicy`` (same directory) against a
+``RoboTwin/script/eval_env_server.py`` running in a separate process.
+Connects via the length-prefixed JSON protocol in the vendored
+``eval_protocol.py``.
 
 Unlike the LeWM client, DINO-WM's checkpoint is *not* self-contained:
 rehydration needs both the ``.pth`` ckpt (submodules pickled directly) and
@@ -87,10 +88,18 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--clear-cache-freq", type=int, default=10)
     p.add_argument("--shutdown-server", action="store_true")
 
-    # MPC knobs
+    # MPC knobs (defaults mirror robotwin_policy.DINOWMRoboTwinPolicy).
+    p.add_argument("--solver", choices=("cem", "gd", "adam", "sgd"), default="cem")
     p.add_argument("--planning-horizon", type=int, default=5)
-    p.add_argument("--planning-iters", type=int, default=100)
-    p.add_argument("--action-scale", type=float, default=1.0)
+    # CEMPlanner (planning/cem.py).
+    p.add_argument("--cem-num-samples", type=int, default=300)
+    p.add_argument("--cem-topk", type=int, default=30)
+    p.add_argument("--cem-var-scale", type=float, default=1.0)
+    p.add_argument("--cem-opt-steps", type=int, default=30)
+    # GDPlanner (planning/gd.py).
+    p.add_argument("--gd-lr", type=float, default=0.1)
+    p.add_argument("--gd-action-noise", type=float, default=0.0)
+    p.add_argument("--gd-opt-steps", type=int, default=30)
     return p.parse_args()
 
 
@@ -212,8 +221,15 @@ def _run_task(
     print(f"[client] dinowm_hydra={hydra_cfg_path}", flush=True)
     if data_path is not None:
         print(f"[client] data_path={data_path}", flush=True)
-    print(f"[client] mpc: horizon={args.planning_horizon} iters={args.planning_iters} "
-          f"act_scale={args.action_scale}", flush=True)
+    if args.solver == "cem":
+        print(f"[client] mpc: solver=cem horizon={args.planning_horizon} "
+              f"samples={args.cem_num_samples} topk={args.cem_topk} "
+              f"var_scale={args.cem_var_scale} opt_steps={args.cem_opt_steps}",
+              flush=True)
+    else:
+        print(f"[client] mpc: solver={args.solver} horizon={args.planning_horizon} "
+              f"lr={args.gd_lr} action_noise={args.gd_action_noise} "
+              f"opt_steps={args.gd_opt_steps}", flush=True)
     if info.get("video_root"):
         print(f"[client] video_root={info['video_root']}", flush=True)
 
@@ -225,9 +241,15 @@ def _run_task(
         task_name=task_name,
         camera_key=camera_key,
         device=args.device,
+        solver=args.solver,
         planning_horizon=args.planning_horizon,
-        planning_iters=args.planning_iters,
-        action_scale=args.action_scale,
+        cem_num_samples=args.cem_num_samples,
+        cem_topk=args.cem_topk,
+        cem_var_scale=args.cem_var_scale,
+        cem_opt_steps=args.cem_opt_steps,
+        gd_lr=args.gd_lr,
+        gd_action_noise=args.gd_action_noise,
+        gd_opt_steps=args.gd_opt_steps,
     )
 
     success = 0
